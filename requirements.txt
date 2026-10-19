@@ -4,3 +4,4 @@ pandas>=2.0
 scipy>=1.11
 plotly>=5.18
 matplotlib
+openpyxl
