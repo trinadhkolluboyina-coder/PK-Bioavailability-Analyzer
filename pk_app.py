@@ -1,16 +1,23 @@
-"""Pharmacokinetic evaluation app (Chapter X: Tables 10.1, 10.2, 10.3, Figs 10.1, 10.2)
-Run:  pip install streamlit numpy pandas scipy plotly
-      streamlit run pk_app.py
-"""
+import io
+import re
+import zipfile
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+from openpyxl.styles import Alignment, Font
 from scipy import stats
 
-st.set_page_config(page_title="PK Evaluation", layout="wide")
+st.set_page_config(page_title="PK Evaluation", page_icon="💊", layout="wide")
 
-# ---------------------------------------------------------------- default data (from the PDF)
+LN2 = 0.693  # same constant used in the notes (t1/2 = 0.693 / Kel)
+
+# ======================================================================================
+# Default reference data (from the notes) -> used ONLY to build the downloadable template
+# ======================================================================================
 TIMES = [0, 0.17, 0.33, 0.5, 0.67, 0.83, 1, 1.17, 1.5, 2, 4, 8, 12]
 REF = np.array([
     [0, 0, 0, 0, 0, 0], [3.58, 4.21, 3.40, 4.26, 3.93, 5.02], [9.24, 8.36, 7.91, 9.63, 10.16, 8.09],
@@ -27,55 +34,190 @@ TEST = np.array([
     [31.63, 31.20, 28.33, 30.04, 29.03, 28.03], [25.94, 25.35, 23.37, 24.56, 22.77, 24.03],
     [15.63, 16.93, 17.04, 15.86, 14.32, 14.89], [6.30, 7.20, 6.33, 6.30, 6.91, 7.84]])
 
+SETTING_MAP = {"reference name": "name_r", "test name": "name_t",
+               "time unit": "time_unit", "concentration unit": "conc_unit"}
 
-def default_df(arr, n):
-    """Time column + n subject columns (pad with NaN / trim as needed)."""
-    data = {"Time (h)": TIMES}
-    for j in range(n):
-        data[f"S{j + 1}"] = arr[:, j] if j < arr.shape[1] else np.nan
-    return pd.DataFrame(data)
+DEFAULTS = dict(name_r="Reference", name_t="Test", time_unit="h", conc_unit="ng/mL",
+                n_term=3, ka_tmax=2.0, abs_t=0.5, paired=True, alpha=0.05,
+                col_r="#1f4e9c", col_t="#c0392b", ver=0, page="📥 Template & Upload")
+for k, v in DEFAULTS.items():
+    st.session_state.setdefault(k, v)
+ss = st.session_state
+
+PAGES = ["📥 Template & Upload", "✏️ Edit / Delete data", "📈 Graphs", "📋 Tables"]
 
 
-# ---------------------------------------------------------------- PK calculations
+# ======================================================================================
+# Helpers: files
+# ======================================================================================
+@st.cache_data
+def make_template() -> bytes:
+    n = REF.shape[1]
+    cols = [f"S{i + 1}" for i in range(n)]
+    ref = pd.DataFrame(REF, columns=cols); ref.insert(0, "Time", TIMES)
+    tst = pd.DataFrame(TEST, columns=cols); tst.insert(0, "Time", TIMES)
+    instr = pd.DataFrame({"How to use this template": [
+        "1. Sheet 'Reference' = reference product, sheet 'Test' = test product. Do NOT rename these sheets.",
+        "2. Column 1 = Time. Every other column = one subject (S1, S2, ...). Add more subjects/rows freely.",
+        "3. Include the time 0 row (concentration 0) for every subject.",
+        "4. Empty rows / empty columns / non-numeric cells are ignored automatically.",
+        "5. Sheet 'Settings' (optional): product names and units used as defaults in the app.",
+        "6. Save as .xlsx and upload it in the app, then press Submit.",
+        "The sample values here are the reference data from the notes (Tables 10.1 and 10.2).",
+    ]})
+    settings = pd.DataFrame({"Setting": ["Reference name", "Test name", "Time unit", "Concentration unit"],
+                             "Value": ["Domstal", "F20", "h", "ng/mL"]})
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        instr.to_excel(w, sheet_name="Instructions", index=False)
+        settings.to_excel(w, sheet_name="Settings", index=False)
+        ref.to_excel(w, sheet_name="Reference", index=False)
+        tst.to_excel(w, sheet_name="Test", index=False)
+        for ws in w.book.worksheets:
+            for c in ws[1]:
+                c.font = Font(bold=True)
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width = 12
+        w.book["Instructions"].column_dimensions["A"].width = 110
+        w.book["Settings"].column_dimensions["A"].width = 24
+        w.book["Settings"].column_dimensions["B"].width = 20
+    return buf.getvalue()
+
+
+def clean_profile(raw: pd.DataFrame):
+    """Drop empty rows/cols, force numeric, merge duplicate times. Returns (df, report)."""
+    df = raw.copy()
+    n0 = len(df)
+    df.columns = [str(c).strip() for c in df.columns]
+    if df.shape[1] < 2:
+        raise ValueError("need a Time column and at least one subject column")
+    tcol = df.columns[0]
+    df = df.apply(pd.to_numeric, errors="coerce")
+    dropped_cols = [c for c in df.columns[1:] if df[c].isna().all()]
+    df = df.drop(columns=dropped_cols).rename(columns={tcol: "Time"})
+    conc = [c for c in df.columns if c != "Time"]
+    if not conc:
+        raise ValueError("no numeric subject columns found")
+    df = df.dropna(subset=["Time"]).dropna(subset=conc, how="all")
+    dups = int(df["Time"].duplicated().sum())
+    if dups:
+        df = df.groupby("Time", as_index=False).mean()
+    df = df.sort_values("Time").reset_index(drop=True)
+    if len(df) < 4:
+        raise ValueError("need at least 4 valid time points")
+    return df, dict(rows_removed=n0 - len(df) - dups, cols_removed=dropped_cols, dup_times=dups)
+
+
+@st.cache_data
+def read_workbook(raw: bytes):
+    xl = pd.ExcelFile(io.BytesIO(raw))
+    def find(prefix):
+        for s in xl.sheet_names:
+            if s.lower().strip().startswith(prefix):
+                return s
+    sr, stt = find("ref"), find("test")
+    if not sr or not stt:
+        raise ValueError("The workbook must contain sheets named 'Reference' and 'Test'.")
+    ref, rep_r = clean_profile(xl.parse(sr))
+    tst, rep_t = clean_profile(xl.parse(stt))
+    settings = {}
+    sn = find("setting")
+    if sn:
+        s = xl.parse(sn)
+        if s.shape[1] >= 2:
+            for a, b in zip(s.iloc[:, 0], s.iloc[:, 1]):
+                if pd.notna(a) and pd.notna(b):
+                    settings[str(a).strip().lower()] = str(b).strip()
+    return dict(ref=ref, test=tst, report=dict(ref=rep_r, test=rep_t), settings=settings)
+
+
+def safe_name(s: str, fallback="table", maxlen=60) -> str:
+    s = re.sub(r"[^\w\-]+", "_", str(s)).strip("_")
+    return (s or fallback)[:maxlen]
+
+
+def safe_sheet(s: str, used: set) -> str:
+    base = re.sub(r"[\[\]:*?/\\]", "", str(s)).strip()[:28] or "Sheet"
+    name, i = base, 1
+    while name.lower() in used:
+        i += 1; name = f"{base}_{i}"
+    used.add(name.lower())
+    return name
+
+
+def to_excel(sheets: dict) -> bytes:
+    buf, used = io.BytesIO(), set()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        for title, df in sheets.items():
+            nm = safe_sheet(title, used)
+            df.to_excel(w, sheet_name=nm, index=False)
+            ws = w.book[nm]
+            for c in ws[1]:
+                c.font = Font(bold=True); c.alignment = Alignment(wrap_text=True)
+            for col in ws.columns:
+                width = max(len(str(c.value)) if c.value is not None else 0 for c in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max(10, width + 2), 40)
+    return buf.getvalue()
+
+
+def fig_bytes(fig, fmt, dpi):
+    b = io.BytesIO()
+    fig.savefig(b, format=fmt, dpi=dpi, facecolor="white", bbox_inches="tight")
+    return b.getvalue()
+
+
+def tin(label, default, key):
+    """text_input whose default follows the settings (key changes when default changes)."""
+    return st.text_input(label, default, key=f"{key}|{default}")
+
+
+# ======================================================================================
+# PK calculations
+# ======================================================================================
 def cum_trapz(x, y):
     seg = (x[1:] - x[:-1]) * (y[1:] + y[:-1]) / 2
-    return np.concatenate([[0], np.cumsum(seg)])
+    return np.concatenate([[0.0], np.cumsum(seg)])
 
 
-def compute(t, c, n_term, ka_tmax, abs_t):
-    """All parameters for ONE concentration-time profile."""
+def pk(t, c, n_term, ka_tmax, abs_t):
+    """All PK parameters for ONE concentration-time profile."""
     t, c = np.asarray(t, float), np.asarray(c, float)
+    ok = ~np.isnan(t) & ~np.isnan(c)
+    t, c = t[ok], c[ok]
+    if len(t) < 4:
+        raise ValueError("too few valid points")
     o = np.argsort(t); t, c = t[o], c[o]
     r = {"t": t, "c": c}
     i = int(np.argmax(c))
     r["Cmax"], r["Tmax"] = c[i], t[i]
 
-    # Kel: least-squares slope of ln C vs t over the last n_term points (terminal phase)
-    pos = np.where(c > 0)[0][-n_term:]
+    pos = np.where(c > 0)[0][-n_term:]                     # terminal phase = last n positive points
+    if len(pos) < 2:
+        raise ValueError("fewer than 2 positive terminal points")
     fit = stats.linregress(t[pos], np.log(c[pos]))
     kel = -fit.slope
-    r.update(Kel=kel, t_half=0.693 / kel if kel > 0 else np.nan, term_idx=pos, term_fit=fit)
+    if not kel > 0:
+        raise ValueError("Kel is not positive – check terminal points")
+    r.update(Kel=kel, t_half=LN2 / kel, term_idx=pos)
 
-    # AUC / AUMC (trapezoidal rule) and extrapolation to infinity
     cauc = cum_trapz(t, c)
-    auc_t = cauc[-1]
-    aumc_t = cum_trapz(t, t * c)[-1]
+    auc_t, aumc_t = cauc[-1], cum_trapz(t, t * c)[-1]
     ct, tl = c[-1], t[-1]
-    r["AUC_t"], r["AUMC_t"] = auc_t, aumc_t
-    r["AUC_inf"] = auc_t + ct / kel                                  # AUC0-t + Ct/Kel
-    r["AUMC_inf"] = aumc_t + tl * ct / kel + ct / kel ** 2
+    r.update(AUC_t=auc_t, AUMC_t=aumc_t, AUC_inf=auc_t + ct / kel,
+             AUMC_inf=aumc_t + tl * ct / kel + ct / kel ** 2)
     r["MRT_t"] = aumc_t / auc_t
     r["MRT_inf"] = r["AUMC_inf"] / r["AUC_inf"]
 
     # Wagner-Nelson:  A_T/Vd = C_T + Kel * AUC(0-T)
     atvd = c + kel * cauc
+    if atvd.max() <= 0:
+        raise ValueError("Wagner-Nelson not computable")
     pct = atvd / atvd.max() * 100
     unabs = 100 - pct
-    r.update(pct_abs=pct, pct_unabs=unabs)
-    r["pct_abs_at"] = float(np.interp(abs_t, t, pct))
+    r.update(atvd=atvd, pct_abs=pct, pct_unabs=unabs, pct_abs_at=float(np.interp(abs_t, t, pct)))
     m = (t <= ka_tmax) & (unabs > 0)
     if m.sum() >= 2:
-        f = stats.linregress(t[m], np.log10(unabs[m]))               # slope = -Ka/2.303
+        f = stats.linregress(t[m], np.log10(unabs[m]))      # slope = -Ka / 2.303
         r.update(Ka=-f.slope * 2.303, ka_fit=f, ka_mask=m)
     else:
         r.update(Ka=np.nan, ka_fit=None, ka_mask=m)
@@ -83,143 +225,376 @@ def compute(t, c, n_term, ka_tmax, abs_t):
 
 
 def summary(df):
-    s = df.iloc[:, 1:]
-    out = pd.DataFrame({"Time (h)": df.iloc[:, 0]})
-    for k in s.columns:
-        out[k] = s[k]
+    s = df.drop(columns="Time")
+    out = df.copy()
     out["Mean"] = s.mean(axis=1)
     out["SD"] = s.std(axis=1, ddof=1)
-    out["CV%"] = out["SD"] / out["Mean"] * 100
-    return out.replace([np.inf, -np.inf], np.nan)
+    out["CV%"] = (out["SD"] / out["Mean"] * 100).replace([np.inf, -np.inf], np.nan)
+    return out
 
 
-def clean(df):
-    d = df.dropna(subset=[df.columns[0]]).dropna(axis=1, how="all")
-    return d.sort_values(d.columns[0]).reset_index(drop=True)
+def param_spec(tu, cu, abs_t):
+    return [("Cmax", cu, "Cmax"), ("Tmax", tu, "Tmax"),
+            ("Ke (elimination rate constant)", f"1/{tu}", "Kel"),
+            ("Ka (absorption rate constant)", f"1/{tu}", "Ka"),
+            ("AUC 0-t", f"{cu}·{tu}", "AUC_t"), ("AUC 0-∞", f"{cu}·{tu}", "AUC_inf"),
+            ("MRT 0-t", tu, "MRT_t"), ("MRT 0-∞", tu, "MRT_inf"),
+            ("AUMC 0-t", f"{cu}·{tu}²", "AUMC_t"), ("AUMC 0-∞", f"{cu}·{tu}²", "AUMC_inf"),
+            ("Half-life (t½)", tu, "t_half"), (f"% absorbed at {abs_t:g} {tu}", "%", "pct_abs_at")]
 
 
-# ---------------------------------------------------------------- sidebar
-st.title("💊 Pharmacokinetic Evaluation — Reference vs Test")
-with st.sidebar:
-    st.header("Settings")
-    name_r = st.text_input("Reference name", "Domstal")
-    name_t = st.text_input("Test name", "F20")
-    n_sub = st.number_input("Number of subjects", 2, 24, 6)
-    n_term = st.slider("Points for Kel (terminal phase, last n)", 2, 6, 3)
-    ka_tmax = st.number_input("Use points up to (h) for Ka fit", 0.5, 24.0, 2.0, 0.25)
-    abs_t = st.number_input("% absorbed at time (h)", 0.1, 12.0, 0.5, 0.1)
-    paired = st.checkbox("Paired t-test (crossover)", True)
-    alpha = st.number_input("Significance level (P <)", 0.001, 0.2, 0.05, 0.005)
-
-tabs = st.tabs(["1️⃣ Enter data (Tables 10.1 / 10.2)", "2️⃣ Fig 10.1", "3️⃣ Fig 10.2", "4️⃣ Table 10.3"])
-
-with tabs[0]:
-    st.caption("Edit values directly; add/delete rows with the table controls. Time in hours, concentration in ng/mL.")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader(f"Table 10.1 – {name_r}")
-        df_r = st.data_editor(default_df(REF, n_sub), num_rows="dynamic", key=f"r{n_sub}", use_container_width=True)
-    with c2:
-        st.subheader(f"Table 10.2 – {name_t}")
-        df_t = st.data_editor(default_df(TEST, n_sub), num_rows="dynamic", key=f"t{n_sub}", use_container_width=True)
-
-df_r, df_t = clean(df_r), clean(df_t)
-try:
-    sr, stt = summary(df_r), summary(df_t)
-    R = compute(df_r.iloc[:, 0], sr["Mean"], n_term, ka_tmax, abs_t)
-    T = compute(df_t.iloc[:, 0], stt["Mean"], n_term, ka_tmax, abs_t)
-except Exception as e:
-    st.error(f"Could not compute — check the data (need ≥ {n_term} positive terminal points). Details: {e}")
-    st.stop()
-
-with tabs[0]:
-    st.markdown("**Mean / SD / CV% (SD = sample SD, n−1)**")
-    fmt = {c: "{:.2f}" for c in sr.columns}
-    a, b = st.columns(2)
-    a.dataframe(sr.style.format(fmt, na_rep="–"), use_container_width=True)
-    b.dataframe(stt.style.format(fmt, na_rep="–"), use_container_width=True)
-
-# ---------------------------------------------------------------- Fig 10.1
-with tabs[1]:
-    fig = go.Figure()
-    for nm, s, col in [(name_r, sr, "#3b5998"), (name_t, stt, "#c0392b")]:
-        fig.add_scatter(x=s["Time (h)"], y=s["Mean"], mode="lines+markers", name=nm, line_color=col,
-                        error_y=dict(type="data", array=s["SD"].fillna(0), visible=True))
-    fig.update_layout(title="Fig 10.1: Time vs plasma concentration (mean ± SD)",
-                      xaxis_title="Time (hours)", yaxis_title="Concentration (ng/ml)", height=520)
-    st.plotly_chart(fig, use_container_width=True)
-
-# ---------------------------------------------------------------- Fig 10.2
-with tabs[2]:
-    fig2 = go.Figure()
-    eqs = []
-    for nm, X, col in [(name_r, R, "#3b5998"), (name_t, T, "#c0392b")]:
-        m = X["ka_mask"]
-        if X["ka_fit"] is None:
-            st.warning(f"{nm}: fewer than 2 usable points for Ka fit — increase the time limit in the sidebar.")
-            continue
-        tt, yy = X["t"][m], np.log10(X["pct_unabs"][m])
-        f = X["ka_fit"]
-        fig2.add_scatter(x=tt, y=yy, mode="markers", name=nm, marker=dict(color=col, size=9))
-        xs = np.array([tt.min(), tt.max()])
-        fig2.add_scatter(x=xs, y=f.intercept + f.slope * xs, mode="lines", showlegend=False, line_color=col)
-        eqs.append(f"**{nm}:** y = {f.slope:.4f}x + {f.intercept:.4f},  R² = {f.rvalue ** 2:.4f}  →  Ka = {X['Ka']:.3f} hr⁻¹")
-    fig2.update_layout(title="Fig 10.2: Time vs log % drug unabsorbed (Wagner–Nelson)",
-                       xaxis_title="Time (hours)", yaxis_title="Log % drug unabsorbed", height=520)
-    st.plotly_chart(fig2, use_container_width=True)
-    for e in eqs:
-        st.markdown(e)
-    with st.expander("Wagner–Nelson table (% absorbed vs time)"):
-        st.dataframe(pd.DataFrame({
-            "Time": R["t"], f"% absorbed {name_r}": R["pct_abs"], f"% unabsorbed {name_r}": R["pct_unabs"],
-            f"% absorbed {name_t}": T["pct_abs"], f"% unabsorbed {name_t}": T["pct_unabs"]}).round(2))
-
-# ---------------------------------------------------------------- Table 10.3
-KEYS = [("Cmax (ng/ml)", "Cmax"), ("Tmax (hr)", "Tmax"), ("Ke (hr⁻¹)", "Kel"), ("Ka (hr⁻¹)", "Ka"),
-        ("AUC0-t (ng·hr/ml)", "AUC_t"), ("AUC0-∞ (ng·hr/ml)", "AUC_inf"),
-        ("MRT0-t (hr)", "MRT_t"), ("MRT0-∞ (hr)", "MRT_inf"),
-        ("AUMC0-t (ng·hr/ml)", "AUMC_t"), ("AUMC0-∞ (ng·hr/ml)", "AUMC_inf"),
-        ("Half life t1/2 (hr)", "t_half"), (f"% absorbed in {abs_t:g} hr", "pct_abs_at")]
-
-
-def per_subject(df):
+def per_subject(df, spec, n_term, ka_tmax, abs_t):
     rows = []
     for col in df.columns[1:]:
-        d = df[[df.columns[0], col]].dropna()
+        d = df[["Time", col]].dropna()
         try:
-            X = compute(d.iloc[:, 0], d.iloc[:, 1], n_term, ka_tmax, abs_t)
-            rows.append({k: X[k] for _, k in KEYS})
+            X = pk(d["Time"], d[col], n_term, ka_tmax, abs_t)
+            rows.append({k: X[k] for _, _, k in spec})
         except Exception:
-            rows.append({k: np.nan for _, k in KEYS})
-    return pd.DataFrame(rows)
+            rows.append({k: np.nan for _, _, k in spec})
+    out = pd.DataFrame(rows)
+    out.insert(0, "Subject", list(df.columns[1:]))
+    return out
 
 
-with tabs[3]:
-    ps_r, ps_t = per_subject(df_r), per_subject(df_t)
-    can_pair = paired and len(ps_r) == len(ps_t)
+def msd(x):
+    x = x.dropna()
+    if len(x) == 0:
+        return "–"
+    return f"{x.mean():.4g}" if len(x) == 1 else f"{x.mean():.4g} ± {x.std(ddof=1):.4g}"
+
+
+# ======================================================================================
+# Callbacks
+# ======================================================================================
+def do_submit():
+    f = ss.get("uploader")
+    if f is None:
+        ss["msg"] = ("error", "Please choose an Excel file first."); return
+    try:
+        wb = read_workbook(f.getvalue())
+    except Exception as e:
+        ss["msg"] = ("error", f"Could not read the file: {e}"); return
+    ss.update(ref=wb["ref"], test=wb["test"], ref0=wb["ref"].copy(), test0=wb["test"].copy(),
+              report=wb["report"], ver=ss["ver"] + 1)
+    for k, sk in SETTING_MAP.items():
+        if k in wb["settings"]:
+            ss[sk] = wb["settings"][k]
+    ss["msg"] = ("success", "Data submitted. Use the sidebar to open Graphs / Tables, or edit the data first.")
+
+
+def do_reset():
+    for k in list(ss.keys()):
+        del ss[k]                      # clears data, settings and the file uploader
+
+
+def do_restore():
+    ss["ref"], ss["test"] = ss["ref0"].copy(), ss["test0"].copy()
+    ss["ver"] += 1
+
+
+def do_delete_subjects():
+    sel = ss.get("del_sel", [])
+    for k in ("ref", "test"):
+        ss[k] = ss[k].drop(columns=[c for c in sel if c in ss[k].columns])
+    ss["del_sel"] = []
+    ss["ver"] += 1
+
+
+def do_add_subject():
+    nums = [int(m.group(1)) for k in ("ref", "test") for c in ss[k].columns
+            if (m := re.fullmatch(r"S(\d+)", str(c)))]
+    new = f"S{(max(nums) if nums else 0) + 1}"
+    for k in ("ref", "test"):
+        ss[k][new] = np.nan
+    ss["ver"] += 1
+
+
+# ======================================================================================
+# Sidebar
+# ======================================================================================
+with st.sidebar:
+    st.title("💊 PK Evaluation")
+    st.title("Developer - Trinadh")
+    st.radio("Navigate", PAGES, key="page")
+    st.button("↺ Reset everything", on_click=do_reset, use_container_width=True)
+    st.divider()
+    st.header("Names & units")
+    st.text_input("Reference product name", key="name_r")
+    st.text_input("Test product name", key="name_t")
+    st.text_input("Time unit", key="time_unit")
+    st.text_input("Concentration unit", key="conc_unit")
+    c1, c2 = st.columns(2)
+    c1.color_picker("Reference colour", key="col_r")
+    c2.color_picker("Test colour", key="col_t")
+    st.header("Calculation settings")
+    st.slider("Points for Kel (last n positive points)", 2, 8, key="n_term")
+    st.number_input("Ka fit: use points up to time", 0.1, 100.0, step=0.25, key="ka_tmax")
+    st.number_input("% absorbed at time", 0.01, 100.0, step=0.1, key="abs_t")
+    st.checkbox("Paired t-test (crossover, same subjects)", key="paired")
+    st.number_input("Significance level (P <)", 0.001, 0.2, step=0.005, format="%.3f", key="alpha")
+
+nm_r, nm_t = ss["name_r"].strip() or "Reference", ss["name_t"].strip() or "Test"
+tu, cu = ss["time_unit"].strip(), ss["conc_unit"].strip()
+n_term, ka_tmax, abs_t, alpha = ss["n_term"], ss["ka_tmax"], ss["abs_t"], ss["alpha"]
+have_data = "ref" in ss
+
+
+def need_data():
+    if not have_data:
+        st.info("No data yet. Go to **📥 Template & Upload**, upload your Excel file and press **Submit**.")
+        st.stop()
+
+
+def get_results():
+    try:
+        sr, stt = summary(ss["ref"]), summary(ss["test"])
+        R = pk(sr["Time"], sr["Mean"], n_term, ka_tmax, abs_t)
+        T = pk(stt["Time"], stt["Mean"], n_term, ka_tmax, abs_t)
+        return sr, stt, R, T
+    except Exception as e:
+        st.error(f"Could not calculate – please check the data / settings (Edit page). Details: {e}")
+        st.stop()
+
+
+def lab(name, unit):
+    return f"{name} ({unit})" if unit.strip() else name
+
+
+# ======================================================================================
+# PAGE 1 – Template & Upload
+# ======================================================================================
+if ss["page"] == PAGES[0]:
+    st.header("Template & Upload")
+    st.markdown("**Step 1 – Download the template** (contains the default reference data; replace/extend it with yours).")
+    st.download_button("⬇ Download Excel template", make_template(), "pk_input_template.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.markdown("**Step 2 – Upload your completed file**, then press **Submit**.")
+    up = st.file_uploader("Excel file (.xlsx) with sheets 'Reference' and 'Test'", type=["xlsx"], key="uploader")
+    if up is not None:
+        try:
+            wb = read_workbook(up.getvalue())
+            st.success("File read successfully. Preview of the cleaned data (empty rows/columns already ignored):")
+            for key, nm in (("ref", "Reference"), ("test", "Test")):
+                rep = wb["report"][key]
+                st.caption(f"**{nm}**: {len(wb[key])} time points × {wb[key].shape[1] - 1} subjects · "
+                           f"empty rows removed: {rep['rows_removed']} · empty columns removed: "
+                           f"{len(rep['cols_removed'])} · duplicate times averaged: {rep['dup_times']}")
+            a, b = st.columns(2)
+            a.dataframe(wb["ref"], use_container_width=True, hide_index=True)
+            b.dataframe(wb["test"], use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"Could not read the file: {e}")
+    b1, b2, _ = st.columns([1, 1, 4])
+    b1.button("✅ Submit", type="primary", on_click=do_submit, use_container_width=True)
+    b2.button("↺ Reset", on_click=do_reset, use_container_width=True)
+    if "msg" in ss:
+        getattr(st, ss["msg"][0])(ss["msg"][1])
+
+# ======================================================================================
+# PAGE 2 – Edit / Delete
+# ======================================================================================
+elif ss["page"] == PAGES[1]:
+    st.header("Edit / Delete data")
+    need_data()
+    st.caption("Edit cells directly. To delete a row: tick the row's left checkbox and press the 🗑 icon / Delete key. "
+               "Blank rows are ignored automatically. Press **Save edits** to apply (changes drive all graphs/tables).")
+    subj = sorted(set(ss["ref"].columns[1:]) | set(ss["test"].columns[1:]))
+    c1, c2, c3 = st.columns([3, 1.3, 1.3])
+    c1.multiselect("Delete subject(s) from both tables", subj, key="del_sel")
+    c2.button("🗑 Delete subjects", on_click=do_delete_subjects, use_container_width=True)
+    c3.button("➕ Add subject column", on_click=do_add_subject, use_container_width=True)
+    st.caption("Tip: save pending cell edits first – deleting/adding subjects reloads the editors.")
+
+    v = ss["ver"]
+    a, b = st.columns(2)
+    with a:
+        st.subheader(nm_r)
+        ed_r = st.data_editor(ss["ref"], num_rows="dynamic", use_container_width=True, key=f"er{v}")
+    with b:
+        st.subheader(nm_t)
+        ed_t = st.data_editor(ss["test"], num_rows="dynamic", use_container_width=True, key=f"et{v}")
+    s1, s2, _ = st.columns([1, 1.5, 3])
+    if s1.button("💾 Save edits", type="primary", use_container_width=True):
+        try:
+            ss["ref"], _ = clean_profile(ed_r)
+            ss["test"], _ = clean_profile(ed_t)
+            ss["ver"] += 1
+            st.rerun()
+        except Exception as e:
+            st.error(f"Not saved: {e}")
+    s2.button("⟲ Restore uploaded data", on_click=do_restore, use_container_width=True)
+
+# ======================================================================================
+# PAGE 3 – Graphs
+# ======================================================================================
+elif ss["page"] == PAGES[2]:
+    st.header("Graphs")
+    need_data()
+    SR, ST, R, T = get_results()
+    zip_slot = st.container()
+    exports = {}
+
+    def graph_panel(gid, d_title, d_x, d_xu, d_y, d_yu, draw, extra=None):
+        with st.container(border=True):
+            c = st.columns(5)
+            with c[0]: title = tin("Graph title", d_title, f"{gid}_t")
+            with c[1]: xn = tin("X-axis name", d_x, f"{gid}_xn")
+            with c[2]: xu = tin("X unit", d_xu, f"{gid}_xu")
+            with c[3]: yn = tin("Y-axis name", d_y, f"{gid}_yn")
+            with c[4]: yu = tin("Y unit", d_yu, f"{gid}_yu")
+            o = st.columns(5)
+            grid = o[0].checkbox("Grid", True, key=f"{gid}_grid")
+            w = o[1].number_input("Width (in)", 3.0, 20.0, 9.0, 0.5, key=f"{gid}_w")
+            h = o[2].number_input("Height (in)", 2.0, 14.0, 5.5, 0.5, key=f"{gid}_h")
+            dpi = o[3].number_input("DPI", 72, 600, 200, 25, key=f"{gid}_dpi")
+            ex = extra() if extra else {}
+            fig, ax = plt.subplots(figsize=(w, h))
+            draw(ax, **ex)
+            ax.set_title(title, fontsize=13, fontweight="bold")
+            ax.set_xlabel(lab(xn, xu)); ax.set_ylabel(lab(yn, yu))
+            if grid:
+                ax.grid(alpha=0.3)
+            ax.legend(frameon=False, fontsize=9)
+            fig.tight_layout()
+            st.pyplot(fig, use_container_width=False)
+            png, jpg = fig_bytes(fig, "png", dpi), fig_bytes(fig, "jpeg", dpi)
+            plt.close(fig)
+            fn = safe_name(title, gid)
+            d1, d2, _ = st.columns([1, 1, 4])
+            d1.download_button("⬇ PNG", png, f"{fn}.png", "image/png", key=f"{gid}_png")
+            d2.download_button("⬇ JPEG", jpg, f"{fn}.jpg", "image/jpeg", key=f"{gid}_jpg")
+            exports[f"{fn}.png"] = png
+
+    # ---- Graph A: mean concentration-time profile
+    def draw_conc(ax, err=True, logy=False):
+        for nm, s, col, mk in [(nm_r, SR, ss["col_r"], "o"), (nm_t, ST, ss["col_t"], "s")]:
+            ax.errorbar(s["Time"], s["Mean"], yerr=s["SD"].fillna(0) if err else None, marker=mk,
+                        color=col, capsize=3, lw=1.6, ms=5, label=nm)
+        if logy:
+            ax.set_yscale("log")
+
+    def conc_extra():
+        a, b = st.columns(2)
+        return dict(err=a.checkbox("Show ±SD error bars", True, key="gA_err"),
+                    logy=b.checkbox("Log Y-axis", False, key="gA_log"))
+
+    graph_panel("gA", "Plasma concentration vs time (mean ± SD)", "Time", tu, "Concentration", cu,
+                draw_conc, conc_extra)
+
+    # ---- Graph B: Wagner-Nelson log % unabsorbed
+    def draw_wn(ax):
+        any_fit = False
+        for nm, X, col, mk in [(nm_r, R, ss["col_r"], "s"), (nm_t, T, ss["col_t"], "D")]:
+            f, m = X["ka_fit"], X["ka_mask"]
+            if f is None:
+                continue
+            any_fit = True
+            tt = X["t"][m]
+            ax.scatter(tt, np.log10(X["pct_unabs"][m]), color=col, marker=mk, s=40, label=nm, zorder=3)
+            xs = np.array([tt.min(), tt.max()])
+            ax.plot(xs, f.intercept + f.slope * xs, color=col, lw=1.6,
+                    label=f"y = {f.slope:.4f}x + {f.intercept:.4f}, R² = {f.rvalue ** 2:.4f}, Ka = {X['Ka']:.3f}")
+        if not any_fit:
+            ax.text(0.5, 0.5, "Not enough points for Ka fit\n(increase 'Ka fit time' in sidebar)",
+                    ha="center", va="center", transform=ax.transAxes)
+
+    graph_panel("gB", "Log % drug unabsorbed vs time (Wagner–Nelson)", "Time", tu,
+                "Log % drug unabsorbed", "", draw_wn)
+
+    # ---- Graph C: % absorbed
+    def draw_abs(ax):
+        for nm, X, col, mk in [(nm_r, R, ss["col_r"], "o"), (nm_t, T, ss["col_t"], "s")]:
+            ax.plot(X["t"], X["pct_abs"], marker=mk, color=col, lw=1.6, ms=5, label=nm)
+
+    graph_panel("gC", "Percent drug absorbed vs time", "Time", tu, "Drug absorbed", "%", draw_abs)
+
+    with zip_slot:
+        zb = io.BytesIO()
+        with zipfile.ZipFile(zb, "w", zipfile.ZIP_DEFLATED) as z:
+            for n, d in exports.items():
+                z.writestr(n, d)
+        st.download_button("📦 Download all graphs (PNG, ZIP)", zb.getvalue(), "graphs.zip", "application/zip")
+
+# ======================================================================================
+# PAGE 4 – Tables
+# ======================================================================================
+else:
+    st.header("Tables")
+    need_data()
+    SR, ST, R, T = get_results()
+    all_slot = st.container()
+    all_tables = {}
+
+    def table_block(key, default_title, df_show, df_export, caption=None):
+        with st.container(border=True):
+            title = tin("Table name", default_title, f"tb_{key}")
+            st.markdown(f"**{title}**")
+            st.dataframe(df_show.style.format(precision=4, na_rep="–"), use_container_width=True, hide_index=True)
+            if caption:
+                st.caption(caption)
+            ex = df_export.copy()
+            num = ex.select_dtypes("number").columns
+            ex[num] = ex[num].round(4)
+            fn = safe_name(title, key)
+            all_tables[title] = ex
+            d1, d2, _ = st.columns([1, 1, 4])
+            d1.download_button("⬇ CSV", ex.to_csv(index=False), f"{fn}.csv", "text/csv", key=f"{key}_csv")
+            d2.download_button("⬇ Excel", to_excel({title: ex}), f"{fn}.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{key}_xlsx")
+
+    # ---- concentration summary tables
+    for key, nm, S in (("sumr", nm_r, SR), ("sumt", nm_t, ST)):
+        d = S.rename(columns={"Time": lab("Time", tu), "Mean": lab("Mean", cu), "SD": lab("SD", cu), "CV%": "CV (%)"})
+        table_block(key, f"Plasma concentrations – {nm}", d, d, f"Concentrations in {cu}; SD = sample SD (n−1).")
+
+    # ---- parameter table
+    spec = param_spec(tu, cu, abs_t)
+    ps_r = per_subject(ss["ref"], spec, n_term, ka_tmax, abs_t)
+    ps_t = per_subject(ss["test"], spec, n_term, ka_tmax, abs_t)
+    can_pair = ss["paired"] and len(ps_r) == len(ps_t)
     rows = []
-    for label, k in KEYS:
+    for label, unit, k in spec:
         a, b = ps_r[k].dropna(), ps_t[k].dropna()
         p = np.nan
-        if len(a) > 1 and len(b) > 1:
+        try:
             if can_pair:
                 ok = ps_r[k].notna() & ps_t[k].notna()
-                p = stats.ttest_rel(ps_r[k][ok], ps_t[k][ok]).pvalue
-            else:
+                if ok.sum() > 1:
+                    p = stats.ttest_rel(ps_r[k][ok], ps_t[k][ok]).pvalue
+            elif len(a) > 1 and len(b) > 1:
                 p = stats.ttest_ind(a, b).pvalue
-        rows.append({"Parameter": label, name_r: R[k], name_t: T[k],
-                     "P-value": p, "Significance": "–" if np.isnan(p) else ("S" if p < alpha else "N.S.")})
-    out = pd.DataFrame(rows)
-    st.subheader("Table 10.3: Pharmacokinetic parameters")
-    st.dataframe(out.style.format({name_r: "{:.4g}", name_t: "{:.4g}", "P-value": "{:.4f}"}, na_rep="–"),
-                 use_container_width=True, hide_index=True)
-    st.caption(
-        f"Parameters are computed from the **mean** concentration–time curve (as in the thesis). "
-        f"Significance uses a {'paired' if can_pair else 'unpaired'} Student's t-test on **per-subject** parameters "
-        f"(S = P < {alpha}). Kel: regression of ln C on the last {n_term} points; t½ = 0.693/Kel; "
-        "AUC by trapezoidal rule, AUC0-∞ = AUC0-t + Ct/Kel; MRT = AUMC/AUC; "
-        "AUMC0-∞ = AUMC0-t + t·Ct/Kel + Ct/Kel²; Ka from slope = −Ka/2.303 of log % unabsorbed (Wagner–Nelson).")
-    st.download_button("⬇ Download Table 10.3 (CSV)", out.to_csv(index=False), "table_10_3.csv", "text/csv")
-    with st.expander("Per-subject parameters"):
-        st.write(name_r); st.dataframe(ps_r.round(3))
-        st.write(name_t); st.dataframe(ps_t.round(3))
+        except Exception:
+            pass
+        rows.append({"Parameter": label, "Unit": unit,
+                     f"{nm_r} (mean curve)": R[k], f"{nm_t} (mean curve)": T[k],
+                     f"{nm_r} (subjects mean ± SD)": msd(ps_r[k]), f"{nm_t} (subjects mean ± SD)": msd(ps_t[k]),
+                     "P-value": p,
+                     "Significance": "–" if np.isnan(p) else ("S" if p < alpha else "N.S.")})
+    ptab = pd.DataFrame(rows)
+    table_block("params", "Pharmacokinetic parameters", ptab, ptab,
+                f"Mean-curve columns follow the notes (parameters from the mean concentration–time curve). "
+                f"P-values: {'paired' if can_pair else 'unpaired'} Student's t-test on per-subject parameters "
+                f"(S = P < {alpha:g}, N.S. = not significant). Kel from regression of ln C on the last {n_term} "
+                f"positive points; t½ = 0.693/Kel; AUC by trapezoidal rule; AUC0-∞ = AUC0-t + Ct/Kel; "
+                f"MRT = AUMC/AUC; Ka from slope = −Ka/2.303 of log % unabsorbed.")
+    if R["AUC_inf"] > 0:
+        st.metric(f"Relative bioavailability, AUC0-∞ ({nm_t} / {nm_r})", f"{T['AUC_inf'] / R['AUC_inf'] * 100:.1f} %")
+
+    # ---- per-subject parameters
+    for key, nm, ps in (("psr", nm_r, ps_r), ("pst", nm_t, ps_t)):
+        d = ps.rename(columns={k: f"{lbl} ({u})" for lbl, u, k in spec})
+        table_block(key, f"Per-subject parameters – {nm}", d, d)
+
+    # ---- Wagner-Nelson tables
+    for key, nm, X in (("wnr", nm_r, R), ("wnt", nm_t, T)):
+        d = pd.DataFrame({lab("Time", tu): X["t"], lab("Concentration", cu): X["c"],
+                          lab("C + Kel·AUC(0-T)", cu): X["atvd"], "% absorbed": X["pct_abs"],
+                          "% unabsorbed": X["pct_unabs"],
+                          "Log10 % unabsorbed": np.where(X["pct_unabs"] > 0,
+                                                         np.log10(np.clip(X["pct_unabs"], 1e-12, None)), np.nan)})
+        table_block(key, f"Wagner–Nelson – {nm}", d, d)
+
+    with all_slot:
+        st.download_button("📦 Download ALL tables (one Excel workbook)", to_excel(all_tables), "pk_tables.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
