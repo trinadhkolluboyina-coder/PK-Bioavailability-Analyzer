@@ -315,7 +315,7 @@ def do_add_subject():
 # ======================================================================================
 with st.sidebar:
     st.title("💊 PK Evaluation")
-    st.title("Developer - Trinadh")
+    st.title("Dev👨🏻‍💻- K.Trinadh")
     st.radio("Navigate", PAGES, key="page")
     st.button("↺ Reset everything", on_click=do_reset, use_container_width=True)
     st.divider()
