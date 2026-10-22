@@ -265,6 +265,36 @@ def msd(x):
 
 
 # ======================================================================================
+# Footer
+# ======================================================================================
+def render_footer():
+    st.markdown(
+        """
+        <style>
+        .block-container { padding-bottom: 80px; }   /* keep content clear of the footer */
+        .pk-footer {
+            position: fixed; left: 0; bottom: 0; width: 100%;
+            padding: 8px 16px; text-align: center; font-size: 0.82rem;
+            background: var(--secondary-background-color, #f0f2f6);
+            color: var(--text-color, #31333f);
+            border-top: 1px solid rgba(128,128,128,0.35);
+            z-index: 99;
+        }
+        .pk-footer a { color: inherit; text-decoration: underline; }
+        </style>
+        <div class="pk-footer">
+            Developed by <b>YOUR NAME</b> · YOUR DESIGNATION ·
+            <b>YOUR ORGANIZATION</b>, City, Country ·
+            <a href="mailto:you@example.com">you@example.com</a> ·
+            <a href="https://your-website.com" target="_blank">Website</a>
+            <br>© 2026 YOUR ORGANIZATION. All rights reserved.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ======================================================================================
 # Callbacks
 # ======================================================================================
 def do_submit():
@@ -315,7 +345,6 @@ def do_add_subject():
 # ======================================================================================
 with st.sidebar:
     st.title("💊 PK Evaluation")
-    st.title("Dev👨🏻‍💻- K.Trinadh")
     st.radio("Navigate", PAGES, key="page")
     st.button("↺ Reset everything", on_click=do_reset, use_container_width=True)
     st.divider()
@@ -338,6 +367,8 @@ nm_r, nm_t = ss["name_r"].strip() or "Reference", ss["name_t"].strip() or "Test"
 tu, cu = ss["time_unit"].strip(), ss["conc_unit"].strip()
 n_term, ka_tmax, abs_t, alpha = ss["n_term"], ss["ka_tmax"], ss["abs_t"], ss["alpha"]
 have_data = "ref" in ss
+
+render_footer()          # footer shown on every page
 
 
 def need_data():
