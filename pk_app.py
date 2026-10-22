@@ -283,11 +283,11 @@ def render_footer():
         .pk-footer a { color: inherit; text-decoration: underline; }
         </style>
         <div class="pk-footer">
-            Developed by <b>YOUR NAME</b> · YOUR DESIGNATION ·
-            <b>YOUR ORGANIZATION</b>, City, Country ·
-            <a href="mailto:you@example.com">you@example.com</a> ·
-            <a href="https://your-website.com" target="_blank">Website</a>
-            <br>© 2026 YOUR ORGANIZATION. All rights reserved.
+            Developed by <b>K. Trinadh, Dr. SSSN Usha Devi N, Dr. G. Varalakshmi</b> ·
+            <b>JNTUK</b>, Kakinada, India ·
+            <a href="mailto:you@example.com">trinadhkolluboyina.com</a> ·
+            
+            <br>© 2026 UCEK, JNTU KAKINADA. All rights reserved.
         </div>
         """,
         unsafe_allow_html=True,
