@@ -286,8 +286,7 @@ def render_footer():
             Developed by <b>K. Trinadh, Dr. SSSN Usha Devi N, Dr. G. Varalakshmi</b> ·
             <b>JNTUK</b>, Kakinada, India ·
             <a href="mailto:you@example.com">trinadhkolluboyina.com</a> ·
-            
-            <br>© 2026 UCEK, JNTU KAKINADA. All rights reserved.
+            © 2026 UCEK, JNTU KAKINADA. All rights reserved.
         </div>
         """,
         unsafe_allow_html=True,
