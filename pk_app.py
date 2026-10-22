@@ -283,9 +283,9 @@ def render_footer():
         .pk-footer a { color: inherit; text-decoration: underline; }
         </style>
         <div class="pk-footer">
-            Developed by <b>K. Trinadh, Dr. SSSN Usha Devi N, Dr. G. Varalakshmi</b> ·
-            <b>JNTUK</b>, Kakinada, India ·
-            <a href="mailto:you@example.com">trinadhkolluboyina.com</a> ·
+            Developed by <b>K. Trinadh, Dr. SSSN Usha Devi N, Dr. G. Varalakshmi</b> |
+            <b>JNTUK</b>, Kakinada, India |
+            <a href="mailto:you@example.com">trinadhkolluboyina@gmail.com</a> |
             © 2026 UCEK, JNTU KAKINADA. All rights reserved.
         </div>
         """,
